@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.pyc
+
+# 运行时文件（日志、pid）
+data/
+*.pid

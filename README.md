@@ -4,7 +4,8 @@
 
 纯 Python 标准库实现，无需安装任何第三方依赖，Python 3.6+ 即可运行。
 
-适用：trae，treaCN，dsh等
+## 适用
+**适用**：trae，treaCN，dsh等 亲测有效
 
 ## 使用步骤
 

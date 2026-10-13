@@ -4,6 +4,9 @@
 
 纯 Python 标准库实现，无需安装任何第三方依赖，Python 3.6+ 即可运行。
 
+## 适用
+**适用**：trae，treaCN，dsh等 亲测有效
+
 **接口格式：** 走 OpenAI 兼容协议（`POST /chat/completions`，请求体与响应体均为 OpenAI 格式），因此 Trae 以及任何 OpenAI 兼容的客户端都能直接接入。
 
 OpenCode Go 官方文档：<https://opencode.ai/v2/docs/console/go/>

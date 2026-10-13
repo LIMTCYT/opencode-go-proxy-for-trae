@@ -3,8 +3,9 @@
 """
 本地反代理：把请求完整双向转发到 OpenCode Go 上游，
 在"发包前"注入 OpenCode 要求的会话/请求头，并做模型名别名重写。
+接口为 OpenAI 兼容格式（/chat/completions），Trae 或任意 OpenAI 兼容客户端均可接入。
 
-背景：OpenCode Go / Zen API (https://opencode.ai/zen/go/v1/...) 要求每个请求带
+背景：OpenCode Go / Zen API 要求每个请求带
   - x-opencode-session : 会话 ID，同一会话内保持稳定（用于提示词缓存路由）
   - x-opencode-request : 请求 ID，同一会话内递增 (msg_1, msg_2, ...)
   - x-opencode-client  : "cli"
@@ -19,7 +20,12 @@ Trae 注意：自定义模型的"模型 ID"不能与官方预设重名（如 glm
 
 运行：
   python opencode-go-proxy-for-trae.py
-Trae 自定义模型请求地址填: http://127.0.0.1:9355/zen/go/v1
+Trae 自定义模型请求地址填: http://127.0.0.1:9355/inference/go/v1 或 /zen/go/v1
+（按客户端路径原样透传，上游两条路由都还在，填哪个都能用）
+注意：model ID 与请求地址要配套，填错会 404 —— 新 model ID（如 deepseek-v4.1-flash）
+只在新路由 /inference/go/v1 提供，老 model ID（如 deepseek-flash）只在旧路由
+/zen/go/v1 提供，请在 Trae 里按模型所属路由填对应 Base URL。
+OpenCode Go 官方文档: https://opencode.ai/v2/docs/console/go/
 
 配置（环境变量）：
   PROXY_PORT     监听端口，默认 9355
@@ -224,16 +230,59 @@ def rewrite_model_alias(raw):
     return raw
 
 
+class ColorConsoleFormatter(logging.Formatter):
+    """控制台专用格式化器：只给关键提示行加颜色，日志文件仍写纯文本。"""
+    KEY_HINTS = ("Trae 请求地址填", "注意：model ID 与请求地址要配套", "OpenCode Go 官方文档")
+    COLOR = "\x1b[1;36m"  # 高亮青色
+    RESET = "\x1b[0m"
+
+    def __init__(self, fmt=None, datefmt=None, color=False):
+        super().__init__(fmt, datefmt)
+        self.color = color
+
+    def format(self, record):
+        msg = super().format(record)
+        if self.color and any(h in record.getMessage() for h in self.KEY_HINTS):
+            return self.COLOR + msg + self.RESET
+        return msg
+
+
+def enable_ansi():
+    """Windows 下开启 ANSI 转义支持，让控制台能显示颜色（失败则忽略，不影响运行）"""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetStdHandle.restype = wintypes.HANDLE
+        kernel32.GetStdHandle.argtypes = [wintypes.DWORD]
+        kernel32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        for std_id in (-11, -12):  # STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+            handle = kernel32.GetStdHandle(std_id)
+            mode = wintypes.DWORD()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+    except Exception:
+        pass
+
+
 def setup_logging():
     """配置 logging：时间戳 + 级别，同时输出到控制台和文件（带大小轮转）"""
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
-                            datefmt="%Y-%m-%d %H:%M:%S")
+    fmt = "%(asctime)s [%(levelname)s] %(message)s"
+    datefmt = "%Y-%m-%d %H:%M:%S"
     console = logging.StreamHandler(sys.stderr)
-    console.setFormatter(fmt)
+    try:
+        is_tty = sys.stderr.isatty()
+    except Exception:
+        is_tty = False
+    console.setFormatter(ColorConsoleFormatter(fmt, datefmt, color=is_tty))
     rotating = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES,
                                    backupCount=LOG_BACKUPS, encoding="utf-8")
-    rotating.setFormatter(fmt)
+    rotating.setFormatter(logging.Formatter(fmt, datefmt))
     LOG.setLevel(logging.INFO)
     LOG.addHandler(console)
     LOG.addHandler(rotating)
@@ -409,6 +458,7 @@ def main():
             sys.stderr.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+    enable_ansi()
     setup_logging()
 
     server = ThreadingHTTPServer(("127.0.0.1", PROXY_PORT), ProxyHandler)
@@ -417,8 +467,19 @@ def main():
     LOG.info("[opencode-go-proxy] listening on http://127.0.0.1:%d", PROXY_PORT)
     LOG.info("[opencode-go-proxy] upstream -> %s://%s", UPSTREAM_PROTO, UPSTREAM_HOST)
     LOG.info("[opencode-go-proxy] 日志文件: %s", LOG_FILE)
-    LOG.info("[opencode-go-proxy] Trae 请求地址填: http://127.0.0.1:%d/zen/go/v1"
-             f"（模型 ID 填 {MODEL_ALIAS_PREFIX}真实模型名）", PROXY_PORT)
+    LOG.info("[opencode-go-proxy] OpenCode Go 官方文档: https://opencode.ai/v2/docs/console/go/")
+    LOG.info("[opencode-go-proxy] 接口为 OpenAI 兼容格式（/chat/completions），"
+             "Trae 或任意 OpenAI 兼容客户端均可接入")
+
+    # 空两行再打印关键信息，终端里更醒目
+    sys.stderr.write("\n\n")
+    sys.stderr.flush()
+    LOG.info("[opencode-go-proxy] Trae 请求地址填: http://127.0.0.1:%d/inference/go/v1（新）或 "
+             "http://127.0.0.1:%d/zen/go/v1（旧）（按客户端路径原样透传，模型 ID 填 %s真实模型名）\n"
+             "注意：model ID 与请求地址要配套，填错会 404 —— "
+             "新 model ID（如 deepseek-v4.1-flash）走 /inference/go/v1，"
+             "老 model ID（如 deepseek-flash）走 /zen/go/v1",
+             PROXY_PORT, PROXY_PORT, MODEL_ALIAS_PREFIX)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

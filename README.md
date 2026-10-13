@@ -4,6 +4,12 @@
 
 纯 Python 标准库实现，无需安装任何第三方依赖，Python 3.6+ 即可运行。
 
+**接口格式：** 走 OpenAI 兼容协议（`POST /chat/completions`，请求体与响应体均为 OpenAI 格式），因此 Trae 以及任何 OpenAI 兼容的客户端都能直接接入。
+
+OpenCode Go 官方文档：<https://opencode.ai/v2/docs/console/go/>
+
+> **近期更新：** opencode 的 Go 接口前缀已由 `/zen/go/v1` 切换为 `/inference/go/v1`，但旧路由仍在上游存在。本代理按客户端路径原样透传，Trae 里填新地址或旧地址都能正常工作；同时注意 **model ID 要和请求地址配套**，填错会报 404。例如新 model ID `deepseek-v4.1-flash` 走 `/inference/go/v1`，老 model ID `deepseek-flash` 走 `/zen/go/v1`。详见下方[配置说明](#2-配置-trae-自定义模型)。
+
 ## 使用步骤
 
 ### 1. 启动代理
@@ -23,9 +29,20 @@ python opencode-go-proxy-for-trae.py
 
 | 配置项 | 填写内容 |
 |---|---|
-| 请求地址（Base URL） | `http://127.0.0.1:9355/zen/go/v1` |
+| 请求地址（Base URL） | `http://127.0.0.1:9355/inference/go/v1`（新）或 `http://127.0.0.1:9355/zen/go/v1`（旧），二者均可用 |
 | 模型 ID | `proxy-` + 真实模型名，例如 `proxy-glm-5.3-flash` |
 | API Key | 你的 OpenCode API Key |
+
+**关于请求地址：** opencode 已把 Go 接口前缀由 `/zen/go/v1` 切换为 `/inference/go/v1`，但上游两条路由都还在。代理按客户端路径原样透传，所以 Trae 里填旧地址或新地址都能正常工作。
+
+**重要：模型 ID 要和请求地址配套，填错会报 model not found / 404。** 部分老 model ID 只在旧路由 `/zen/go/v1` 提供，新 model ID 只在新路由 `/inference/go/v1` 提供：
+
+| 模型 | model ID（加 `proxy-` 前缀） | 对应请求地址 |
+|---|---|---|
+| 新模型 | `proxy-deepseek-v4.1-flash` 等 | `http://127.0.0.1:9355/inference/go/v1` |
+| 老模型 | `proxy-deepseek-flash` 等 | `http://127.0.0.1:9355/zen/go/v1` |
+
+在 Trae 里按模型所属路由填对应的 Base URL，才能落到正确的上游路由。
 
 **重要：模型 ID 必须加 `proxy-` 前缀。** 如果与官方预设重名（如直接填 `glm-5.3-flash`），Trae 会把对话流量路由到自己的云端通道，完全绕过本代理。代理会把前缀剥掉，还原为真实模型名再发给上游。
 
@@ -51,7 +68,7 @@ $env:PROXY_PORT = "9356"
 python opencode-go-proxy-for-trae.py
 ```
 
-端口变了的话，Trae 请求地址相应改为 `http://127.0.0.1:9356/zen/go/v1`。
+端口变了的话，Trae 请求地址相应改为 `http://127.0.0.1:9356/zen/go/v1` 或 `http://127.0.0.1:9356/inference/go/v1`（按模型所属路由选）。
 
 ## 日志与排错
 

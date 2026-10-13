@@ -11,7 +11,8 @@
 
 OpenCode Go 官方文档：<https://opencode.ai/v2/docs/console/go/>
 
-> **近期更新：** opencode 的 Go 接口前缀已由 `/zen/go/v1` 切换为 `/inference/go/v1`，但旧路由仍在上游存在。本代理按客户端路径原样透传，Trae 里填新地址或旧地址都能正常工作；同时注意 **model ID 要和请求地址配套**，填错会报 404。例如新 model ID `deepseek-v4.1-flash` 走 `/inference/go/v1`，老 model ID `deepseek-flash` 走 `/zen/go/v1`。详见下方[配置说明](#2-配置-trae-自定义模型)。
+> [!IMPORTANT]
+> **近期更新：** opencode 的 Go 接口前缀已由 `/zen/go/v1` 切换为 `/inference/go/v1`，但旧路由仍在上游存在。本代理按客户端路径原样透传，Trae 里填新地址或旧地址都能正常工作；同时注意 **model ID 要和请求地址配套**，填错会报 404。例如新 model ID `deepseek-v4.1-flash` 走 `/inference/go/v1`，老 model ID `deepseek-flash` 走 `/zen/go/v1`。详见下方[配置说明](#2-配置-trae-自定义模型)。完整变更见 [更新日志](CHANGELOG.md)。
 
 ## 使用步骤
 

@@ -47,6 +47,9 @@ OpenCode Go 官方文档: https://opencode.ai/v2/docs/console/go/
   CONTENT_IDLE_TIMEOUT
                  最后兜底（秒），默认 1800；距上一次内容产出（content /
                  reasoning_content / tool_calls）超过该时长即主动终止请求，0 表示不限制
+  RETRY_ON_5XX_MAX
+                 上游 5xx 自动重试上限（次），默认 5；仅在尚未向客户端吐出任何数据时生效，
+                 用于吞掉上游网关的瞬时 5xx（如响应体为空的 503），0 表示不重试
   PID_FILE       pid 文件路径，默认脚本同目录 .opencode-go-proxy-for-trae.pid
   STATS_WINDOW   /stats 汇总使用的内存样本窗口，默认 200
 
@@ -61,6 +64,11 @@ OpenCode Go 官方文档: https://opencode.ai/v2/docs/console/go/
   无论走哪条路径，只要距上一次"内容产出"超过 CONTENT_IDLE_TIMEOUT 秒（默认 1800，
   即整整 30 分钟没吐出任何内容 token），代理就主动终止请求并以 SSE error 事件收尾。
   判的是"没产出"，不是"总时长"，所以正常慢慢出字的长任务不会被误伤。
+
+上游 5xx 自动重试：
+  上游返回 5xx（例如响应体为空的 503）时，只要还没向客户端吐出任何数据，代理会退避 1 秒
+  后重发（上限由 RETRY_ON_5XX_MAX 控制，默认 5 次）。这类 5xx 多为上游网关瞬时故障，
+  重发通常即可成功，客户端看不到错误；4xx（如 429 限流）不重试。
 
 指标观测：
   每次请求记录 TTFT（发包 -> 首个内容 token）、总耗时、输出 token 与吞吐，
@@ -99,6 +107,11 @@ HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL") or 10)
 # 最后兜底（秒）：距上一次"内容产出"（content / reasoning_content / tool_calls）超过该时长
 # 即主动终止请求，避免上游一直慢速输出却拿不到结果、白扣 token。0 表示不限制。
 CONTENT_IDLE_TIMEOUT = float(os.environ.get("CONTENT_IDLE_TIMEOUT") or 1800)
+# 上游 5xx 自动重试上限（次）：只在"还没向客户端吐出任何数据"时生效，此时重试不会产生重复内容。
+# 用于吞掉上游网关的瞬时 5xx（例如响应体为空的 503）。0 表示不重试。
+RETRY_ON_5XX_MAX = int(os.environ.get("RETRY_ON_5XX_MAX") or 5)
+# 5xx 重试前的退避秒数，给上游一点恢复时间
+RETRY_ON_5XX_BACKOFF = 1.0
 MODEL_ALIAS_PREFIX = "proxy-"
 
 # 日志文件：默认脚本同目录 data\opencode-go-proxy.log，超过 5MB 自动轮转
@@ -291,6 +304,9 @@ class ColorConsoleFormatter(logging.Formatter):
     COLOR = "\x1b[1;36m"  # 高亮青色
     TTFT_MARK = "[ttft]"
     TTFT_COLOR = "\x1b[1;32m"  # 高亮绿色（指标行，方便一眼扫到）
+    # 上游返回非 200（4xx/5xx）就是有问题：整行标黄，一眼可见
+    NON_200_MARK = re.compile(r"-> [45]\d{2}\b|status=[45]\d{2}\b|HTTP/1\.1\" [45]\d{2}\b")
+    WARN_COLOR = "\x1b[1;33m"  # 高亮黄色
     RESET = "\x1b[0m"
 
     def __init__(self, fmt=None, datefmt=None, color=False):
@@ -302,6 +318,8 @@ class ColorConsoleFormatter(logging.Formatter):
         if not self.color:
             return msg
         text = record.getMessage()
+        if self.NON_200_MARK.search(text):
+            return self.WARN_COLOR + msg + self.RESET
         if self.TTFT_MARK in text:
             return self.TTFT_COLOR + msg + self.RESET
         if any(h in text for h in self.KEY_HINTS):
@@ -719,6 +737,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         attempts = []
         pending = [0]
         retry_fired = [False]
+        retry5xx_used = [0]
         # 只有流式请求才能靠 SSE 注释续命：非流式响应无法在不提交响应头的前提下发心跳
         heartbeat_ok = stream_hint is True
         retry_deadline = metrics.t_start + RETRY_AFTER
@@ -782,6 +801,32 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             pending[0] -= 1
             if e is None:
+                if (not committed and r.status >= 500
+                        and retry5xx_used[0] < RETRY_ON_5XX_MAX):
+                    # 上游网关瞬时 5xx（常见是响应体为空的 503）。此时还没向客户端吐过任何数据，
+                    # 丢掉这一轮并退避重发即可，客户端完全无感。
+                    retry5xx_used[0] += 1
+                    n = retry5xx_used[0]
+                    try:
+                        snippet = r.read()[:800].decode("utf-8", errors="replace")
+                    except Exception:
+                        snippet = ""
+                    LOG.warning("[attempt] 上游 %d，退避 %gs 后重发（第 %d/%d 次）: %s "
+                                "(request=msg_%d)",
+                                r.status, RETRY_ON_5XX_BACKOFF, n, RETRY_ON_5XX_MAX,
+                                snippet, req_num)
+                    for a in attempts:
+                        a.abandon()
+                    attempts = []
+                    while True:      # 丢弃被放弃那条可能已入队的陈旧结果
+                        try:
+                            result_q.get_nowait()
+                        except queue.Empty:
+                            break
+                    pending[0] = 0
+                    time.sleep(RETRY_ON_5XX_BACKOFF)
+                    start_attempt("retry5xx-%d" % n)
+                    continue
                 winner, resp = attempt, r
                 break
             err = e

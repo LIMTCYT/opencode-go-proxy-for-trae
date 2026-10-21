@@ -35,8 +35,32 @@ OpenCode Go 官方文档: https://opencode.ai/v2/docs/console/go/
   UPSTREAM_HOST  上游主机，默认 opencode.ai
   UPSTREAM_PROTO 上游协议，默认 https
   OPENCODE_UA    注入的 User-Agent，默认 opencode/1.18.29 cli
+  UPSTREAM_TIMEOUT
+                 单次上游尝试的 socket 超时（秒），默认 120；涵盖建连、TLS 握手、
+                 等响应头与每次读数据块，静默超过该值即判定这条连接失败
+  HEARTBEAT_AFTER
+                 慢路径阈值（秒），默认 30；上游超过该时长仍无响应头时，先回 200 + SSE
+                 并周期发心跳吊住客户端（仅流式请求）
+  RETRY_AFTER    竞速重试阈值（秒），默认 60；到点另开一条连接重发同一请求，谁先回数据用谁
+  HEARTBEAT_INTERVAL
+                 慢路径心跳间隔（秒），默认 10
+  CONTENT_IDLE_TIMEOUT
+                 最后兜底（秒），默认 1800；距上一次内容产出（content /
+                 reasoning_content / tool_calls）超过该时长即主动终止请求，0 表示不限制
   PID_FILE       pid 文件路径，默认脚本同目录 .opencode-go-proxy-for-trae.pid
   STATS_WINDOW   /stats 汇总使用的内存样本窗口，默认 200
+
+慢路径（上游迟迟不响应时）：
+  上游超过 HEARTBEAT_AFTER 秒仍没回响应头，代理会先向客户端回 200 + SSE，
+  每 HEARTBEAT_INTERVAL 秒发一个 SSE 注释心跳（": keepalive"）避免客户端自己超时；
+  到 RETRY_AFTER 秒再开第二条连接竞速重发，谁先回数据用谁，另一条关掉。
+  代价：进入慢路径后响应头已提交，上游若随后报错只能以 SSE error 事件下发；
+  竞速重发可能被上游计费两次（被丢弃的那份）。
+
+最后兜底（防持续扣费）：
+  无论走哪条路径，只要距上一次"内容产出"超过 CONTENT_IDLE_TIMEOUT 秒（默认 1800，
+  即整整 30 分钟没吐出任何内容 token），代理就主动终止请求并以 SSE error 事件收尾。
+  判的是"没产出"，不是"总时长"，所以正常慢慢出字的长任务不会被误伤。
 
 指标观测：
   每次请求记录 TTFT（发包 -> 首个内容 token）、总耗时、输出 token 与吞吐，
@@ -49,8 +73,10 @@ import http.client
 import json
 import logging
 import os
+import queue
 import re
 import secrets
+import socket
 import sys
 import threading
 import time
@@ -62,6 +88,17 @@ PROXY_PORT = int(os.environ.get("PROXY_PORT") or 9355)
 UPSTREAM_HOST = os.environ.get("UPSTREAM_HOST") or "opencode.ai"
 UPSTREAM_PROTO = (os.environ.get("UPSTREAM_PROTO") or "https").lower()
 OPENCODE_UA = os.environ.get("OPENCODE_UA") or "opencode/1.18.29 cli"
+# 单次上游尝试的 socket 超时（秒）：作用于建连、TLS 握手、发送、等响应头以及每次读数据块。
+# 任一次尝试静默超过该值即判定这条连接失败（慢路径下另有竞速重试兜底）。
+UPSTREAM_TIMEOUT = float(os.environ.get("UPSTREAM_TIMEOUT") or 120)
+# 慢路径阈值（秒）：上游超过 HEARTBEAT_AFTER 仍无响应头时，先回 200 + SSE 并周期发心跳，
+# 吊住客户端；到 RETRY_AFTER 再开第二条连接竞速重发，谁先回数据用谁。
+HEARTBEAT_AFTER = float(os.environ.get("HEARTBEAT_AFTER") or 30)
+RETRY_AFTER = float(os.environ.get("RETRY_AFTER") or 60)
+HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL") or 10)
+# 最后兜底（秒）：距上一次"内容产出"（content / reasoning_content / tool_calls）超过该时长
+# 即主动终止请求，避免上游一直慢速输出却拿不到结果、白扣 token。0 表示不限制。
+CONTENT_IDLE_TIMEOUT = float(os.environ.get("CONTENT_IDLE_TIMEOUT") or 1800)
 MODEL_ALIAS_PREFIX = "proxy-"
 
 # 日志文件：默认脚本同目录 data\opencode-go-proxy.log，超过 5MB 自动轮转
@@ -342,6 +379,7 @@ class RequestMetrics(object):
         self.stream_hint = stream_hint
         self.first_byte_at = None
         self.first_token_at = None
+        self.last_content_at = None
         self.usage_tokens = None
         self.content_events = 0
         self.is_sse = False
@@ -403,6 +441,7 @@ class RequestMetrics(object):
         if has_content:
             if self.first_token_at is None:
                 self.first_token_at = now
+            self.last_content_at = now
             self.content_events += 1
 
     def on_json_body(self, body_bytes):
@@ -418,6 +457,16 @@ class RequestMetrics(object):
         usage = obj.get("usage")
         if isinstance(usage, dict) and isinstance(usage.get("completion_tokens"), int):
             self.usage_tokens = usage["completion_tokens"]
+
+    def content_idle_exceeded(self, now=None):
+        """
+        距上一次内容 token（content / reasoning_content / tool_calls）是否已超过兜底上限。
+        从未产出过内容时以发包时刻起算；CONTENT_IDLE_TIMEOUT <= 0 表示不限制。
+        """
+        if CONTENT_IDLE_TIMEOUT <= 0:
+            return False
+        anchor = self.last_content_at if self.last_content_at is not None else self.t_start
+        return ((now or time.perf_counter()) - anchor) >= CONTENT_IDLE_TIMEOUT
 
     def finish(self, status, session_id=None, request_id=None):
         """结算并记录一行 [ttft] 日志；重复调用只生效一次"""
@@ -518,6 +567,55 @@ def aggregate_stats(records):
     }
 
 
+class UpstreamAttempt(threading.Thread):
+    """
+    一次上游请求尝试。放在后台线程里跑，结果经队列回传，
+    这样主线程可以边等结果边发心跳、并在超时后另开一条连接竞速。
+    无论成功失败都必定回传一次结果，主线程不会空等。
+    """
+
+    def __init__(self, tag, method, path, body_bytes, headers, result_q):
+        super().__init__(daemon=True)
+        self.tag = tag
+        self.method = method
+        self.path = path
+        self.body_bytes = body_bytes
+        self.headers = headers
+        self.result_q = result_q
+        self.conn = None
+
+    def run(self):
+        try:
+            if UPSTREAM_PROTO == "https":
+                self.conn = http.client.HTTPSConnection(UPSTREAM_HOSTNAME, UPSTREAM_PORT,
+                                                        timeout=UPSTREAM_TIMEOUT)
+            else:
+                self.conn = http.client.HTTPConnection(UPSTREAM_HOSTNAME, UPSTREAM_PORT,
+                                                       timeout=UPSTREAM_TIMEOUT)
+            self.conn.request(self.method, self.path,
+                              body=self.body_bytes, headers=self.headers)
+            resp = self.conn.getresponse()
+            self.result_q.put((self, resp, None))
+        except socket.timeout:
+            self.result_q.put((self, None,
+                               "no response in %gs" % UPSTREAM_TIMEOUT))
+        except Exception as e:  # 含 OSError/ssl 错误：必须回传，否则主线程会空等
+            self.result_q.put((self, None, "upstream error: %s" % e))
+
+    def abandon(self):
+        """竞速落败后关掉这条连接；shutdown 可尽快唤醒仍在阻塞读的线程"""
+        try:
+            if self.conn is not None and self.conn.sock is not None:
+                self.conn.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            if self.conn is not None:
+                self.conn.close()
+        except OSError:
+            pass
+
+
 class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -612,32 +710,130 @@ class ProxyHandler(BaseHTTPRequestHandler):
                  out_headers["User-Agent"],
                  "present" if self.headers.get("Authorization") else "MISSING")
 
-        # ---- 发往上游 ----
-        if UPSTREAM_PROTO == "https":
-            conn = http.client.HTTPSConnection(UPSTREAM_HOSTNAME, UPSTREAM_PORT, timeout=600)
-        else:
-            conn = http.client.HTTPConnection(UPSTREAM_HOSTNAME, UPSTREAM_PORT, timeout=600)
-        # t_start 即为发包时刻
+        # ---- 发往上游（含慢路径心跳与竞速重试）----
+        # 快路径：上游在 HEARTBEAT_AFTER 内返回响应头，完全按原样透传（含真实错误码）。
+        # 慢路径：超时仍无响应头时先回 200 + SSE 并周期发心跳吊住客户端，
+        #         到 RETRY_AFTER 另开一条连接竞速重发，谁先回数据用谁。
         metrics = RequestMetrics(model_name, stream_hint)
-        try:
-            conn.request(method, self.path, body=body_bytes, headers=out_headers)
-            resp = conn.getresponse()
-        except OSError as e:
-            metrics.error = "proxy upstream error: %s" % e
-            metrics.finish(502, session_id, "msg_%d" % req_num)
-            self._send_proxy_error(f"proxy upstream error: {e}")
-            conn.close()
+        result_q = queue.Queue()
+        attempts = []
+        pending = [0]
+        retry_fired = [False]
+        # 只有流式请求才能靠 SSE 注释续命：非流式响应无法在不提交响应头的前提下发心跳
+        heartbeat_ok = stream_hint is True
+        retry_deadline = metrics.t_start + RETRY_AFTER
+        heartbeat_deadline = metrics.t_start + HEARTBEAT_AFTER
+        committed = False
+        next_heartbeat_at = None
+
+        def start_attempt(tag):
+            attempt = UpstreamAttempt(tag, method, self.path, body_bytes, out_headers, result_q)
+            attempts.append(attempt)
+            pending[0] += 1
+            attempt.start()
+            LOG.info("[attempt] %s 已发出 (session=%s, request=msg_%d)",
+                     tag, session_id, req_num)
+
+        start_attempt("initial")
+
+        winner = None
+        resp = None
+        err = None
+        while pending[0] > 0:
+            now = time.perf_counter()
+            marks = []
+            if not retry_fired[0]:
+                marks.append(retry_deadline)
+            if heartbeat_ok and not committed:
+                marks.append(heartbeat_deadline)
+            if next_heartbeat_at is not None:
+                marks.append(next_heartbeat_at)
+            future = [m for m in marks if m > now]
+            if future:
+                wait = min(future) - now
+            elif marks:
+                wait = 0.0          # 有已到期的定时动作，立即处理
+            else:
+                wait = HEARTBEAT_INTERVAL
+
+            try:
+                attempt, r, e = result_q.get(timeout=max(0.001, wait))
+            except queue.Empty:
+                now = time.perf_counter()
+                if heartbeat_ok and not committed and now >= heartbeat_deadline:
+                    self._commit_sse_head()
+                    committed = True
+                    next_heartbeat_at = now + HEARTBEAT_INTERVAL
+                    LOG.info("[slow-path] 上游 %gs 无响应，已提前回 200 并开始心跳 "
+                             "(request=msg_%d)", HEARTBEAT_AFTER, req_num)
+                if committed and next_heartbeat_at is not None and now >= next_heartbeat_at:
+                    if not self._write_chunk(b": keepalive\n\n"):
+                        LOG.info("[proxy] 客户端已断开，停止心跳 (request=msg_%d)", req_num)
+                        for a in attempts:
+                            a.abandon()
+                        metrics.error = "client gone during slow path"
+                        metrics.finish(200, session_id, "msg_%d" % req_num)
+                        return
+                    next_heartbeat_at = now + HEARTBEAT_INTERVAL
+                if not retry_fired[0] and now >= retry_deadline:
+                    retry_fired[0] = True
+                    start_attempt("retry")
+                continue
+
+            pending[0] -= 1
+            if e is None:
+                winner, resp = attempt, r
+                break
+            err = e
+            LOG.warning("[attempt] %s 失败: %s (request=msg_%d)", attempt.tag, e, req_num)
+            if pending[0] == 0 and not retry_fired[0]:
+                # 首条就报错（如握手被拒）：不等定时器，立刻补一次重试
+                retry_fired[0] = True
+                start_attempt("retry")
+
+        # 竞速收敛：只留胜出那条，其余关掉
+        for a in attempts:
+            if a is not winner:
+                a.abandon()
+
+        if winner is None:
+            metrics.error = err or "upstream failed"
+            metrics.finish(504, session_id, "msg_%d" % req_num)
+            if committed:
+                # 已提前回 200，错误只能作为 SSE 事件下发
+                self._write_chunk(self._sse_error_payload(504, err or "upstream failed"))
+                self._end_chunked()
+            else:
+                self._send_proxy_error("proxy upstream failed: %s" % (err or "unknown"), 504)
             return
 
+        conn = winner.conn
         status = 0
         try:
             status = resp.status
-            LOG.info("[upstream] %s %s -> %d (session=%s, request=msg_%d)",
-                     method, self.path, status, session_id, req_num)
+            LOG.info("[upstream] %s %s -> %d (session=%s, request=msg_%d, attempt=%s)",
+                     method, self.path, status, session_id, req_num, winner.tag)
 
             resp_is_chunked = "chunked" in (resp.getheader("Transfer-Encoding") or "").lower()
             # SSE 判定：上游 Content-Type 声明，或首个数据块以 data: 开头
             sse_mode = "event-stream" in (resp.getheader("Content-Type") or "").lower()
+
+            if committed:
+                # 已提前回 200 + SSE：上游结果并入这条流，错误以 SSE 事件下发并收尾
+                if status >= 400:
+                    err_body = resp.read()
+                    metrics.on_chunk(err_body, is_sse=False)
+                    snippet = err_body[:800].decode("utf-8", errors="replace")
+                    LOG.error("[upstream-error] body: %s", snippet)
+                    metrics.error = "upstream %d on slow path" % status
+                    self._write_chunk(self._sse_error_payload(status, snippet))
+                else:
+                    self._pump_stream(resp, metrics, sse_mode)
+                    if metrics.error:
+                        self._write_chunk(self._sse_error_payload(504, metrics.error))
+                self._end_chunked()
+                return
+
             # 转发上游响应头（跳过逐跳头与自行管理的长度/编码头）
             self.send_response(status)
             for k, v in resp.getheaders():
@@ -661,25 +857,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 # 上游为流式响应（SSE）：以 chunked 转发给客户端
                 self.send_header("Transfer-Encoding", "chunked")
                 self.end_headers()
-                sent = 0
-                try:
-                    while True:
-                        # read1：有多少取多少，避免 read() 凑满 8192 字节才返回，
-                        # 否则首包延迟被放大，TTFT 与客户端首字都会失真
-                        chunk = resp.read1(8192)
-                        if not chunk:
-                            break
-                        if not sse_mode and chunk.lstrip(b"\r\n \t").startswith(b"data:"):
-                            sse_mode = True
-                        metrics.on_chunk(chunk, is_sse=sse_mode)
-                        sent += len(chunk)
-                        self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
-                        self.wfile.flush()
-                    self.wfile.write(b"0\r\n\r\n")
-                    self.wfile.flush()
-                except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
-                    # 客户端收完提前断开，属正常现象
-                    LOG.info("[proxy] 客户端提前断开（已发送 %d 字节），正常忽略", sent)
+                if self._pump_stream(resp, metrics, sse_mode):
+                    if metrics.error:
+                        # 兜底主动终止：明确告知客户端，而不是让它看到一个静默截断的流
+                        self._write_chunk(self._sse_error_payload(504, metrics.error))
+                    self._end_chunked()
             else:
                 # 非流式：按上游声明的长度透传
                 clen = resp.getheader("Content-Length")
@@ -690,6 +872,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     self.close_connection = True
                 self.end_headers()
                 collected = []
+                sent = 0
                 try:
                     while True:
                         chunk = resp.read1(8192)
@@ -698,10 +881,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         if not sse_mode and chunk.lstrip(b"\r\n \t").startswith(b"data:"):
                             sse_mode = True
                         metrics.on_chunk(chunk, is_sse=sse_mode)
+                        sent += len(chunk)
+                        if self._content_idle_abort(metrics, sent):
+                            break
                         collected.append(chunk)
                         self.wfile.write(chunk)
                 except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
                     pass
+                except socket.timeout:
+                    metrics.error = "upstream stalled >%gs" % UPSTREAM_TIMEOUT
+                    LOG.warning("[proxy] 上游超时（非流式，%gs 无新数据）", UPSTREAM_TIMEOUT)
+                    self.close_connection = True
                 if not sse_mode and collected:
                     metrics.on_json_body(b"".join(collected))
         finally:
@@ -713,10 +903,87 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 pass
             conn.close()
 
-    def _send_proxy_error(self, message):
+    def _pump_stream(self, resp, metrics, sse_mode):
+        """
+        把上游流式响应按 chunked 转发给客户端。
+        返回 True 表示应当正常收尾（上游读完，或代理按兜底主动终止）；
+        返回 False 表示应保持截断（客户端已断开或上游静默），不补 chunked 结束块，
+        让客户端判定为响应被截断。
+        """
+        sent = 0
+        try:
+            while True:
+                # read1：有多少取多少，避免 read() 凑满 8192 字节才返回，
+                # 否则首包延迟被放大，TTFT 与客户端首字都会失真
+                chunk = resp.read1(8192)
+                if not chunk:
+                    break
+                if not sse_mode and chunk.lstrip(b"\r\n \t").startswith(b"data:"):
+                    sse_mode = True
+                metrics.on_chunk(chunk, is_sse=sse_mode)
+                sent += len(chunk)
+                if self._content_idle_abort(metrics, sent):
+                    # 兜底主动终止：由调用方补一个 SSE error 事件再收尾
+                    return True
+                self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
+                self.wfile.flush()
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            # 客户端收完提前断开，属正常现象
+            LOG.info("[proxy] 客户端提前断开（已发送 %d 字节），正常忽略", sent)
+            return False
+        except socket.timeout:
+            # 流式中途上游静默：不补结束块，让客户端判定为响应被截断
+            metrics.error = "upstream stalled >%gs mid-stream" % UPSTREAM_TIMEOUT
+            LOG.warning("[proxy] 上游流式中断（%gs 无新数据，已发送 %d 字节）",
+                        UPSTREAM_TIMEOUT, sent)
+            self.close_connection = True
+            return False
+        return True
+
+    def _content_idle_abort(self, metrics, sent):
+        """兜底：距上次内容产出超过 CONTENT_IDLE_TIMEOUT 即主动终止本次转发"""
+        if not metrics.content_idle_exceeded():
+            return False
+        metrics.error = "no content output for %gs" % CONTENT_IDLE_TIMEOUT
+        LOG.warning("[proxy] 兜底终止：%gs 无任何内容产出（已发送 %d 字节），主动断开",
+                    CONTENT_IDLE_TIMEOUT, sent)
+        self.close_connection = True
+        return True
+
+    def _commit_sse_head(self):
+        """慢路径：上游尚未响应时先提交 200 + SSE，为发送心跳保活铺路"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+
+    def _write_chunk(self, data):
+        """按 chunked 写一个数据块；客户端已断开时返回 False"""
+        try:
+            self.wfile.write(b"%x\r\n" % len(data) + data + b"\r\n")
+            self.wfile.flush()
+            return True
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            return False
+
+    def _end_chunked(self):
+        try:
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            pass
+
+    @staticmethod
+    def _sse_error_payload(status, message):
+        payload = json.dumps({"error": {"code": status, "message": message}},
+                             ensure_ascii=False)
+        return ("data: " + payload + "\n\n").encode("utf-8")
+
+    def _send_proxy_error(self, message, status=502):
         try:
             payload = json.dumps({"error": {"message": message}}).encode("utf-8")
-            self.send_response(502)
+            self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()

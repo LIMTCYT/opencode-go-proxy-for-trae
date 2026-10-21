@@ -48,8 +48,13 @@ OpenCode Go 官方文档: https://opencode.ai/v2/docs/console/go/
                  最后兜底（秒），默认 1800；距上一次内容产出（content /
                  reasoning_content / tool_calls）超过该时长即主动终止请求，0 表示不限制
   RETRY_ON_5XX_MAX
-                 上游 5xx 自动重试上限（次），默认 5；仅在尚未向客户端吐出任何数据时生效，
-                 用于吞掉上游网关的瞬时 5xx（如响应体为空的 503），0 表示不重试
+                 上游错误自动重试上限（次），默认 10；仅在尚未向客户端吐出任何数据时生效，
+                 覆盖 5xx 与"Endpoint is unavailable"这类被标成 429 的瞬时端点故障，
+                 0 表示不重试
+  RETRY_429_BACKOFFS
+                 429 重试的退避序列（秒），默认 4,8,16,32,64；指数递增，给服务端留恢复窗口
+  RETRY_BUDGET   重试总时长预算（秒），默认 60；仅在无法心跳续命的请求（非流式）上生效，
+                 累计等待将超过该预算即放弃重试、原样透传真实状态码，0 表示不限制
   PID_FILE       pid 文件路径，默认脚本同目录 .opencode-go-proxy-for-trae.pid
   STATS_WINDOW   /stats 汇总使用的内存样本窗口，默认 200
 
@@ -65,10 +70,17 @@ OpenCode Go 官方文档: https://opencode.ai/v2/docs/console/go/
   即整整 30 分钟没吐出任何内容 token），代理就主动终止请求并以 SSE error 事件收尾。
   判的是"没产出"，不是"总时长"，所以正常慢慢出字的长任务不会被误伤。
 
-上游 5xx 自动重试：
-  上游返回 5xx（例如响应体为空的 503）时，只要还没向客户端吐出任何数据，代理会退避 1 秒
-  后重发（上限由 RETRY_ON_5XX_MAX 控制，默认 5 次）。这类 5xx 多为上游网关瞬时故障，
-  重发通常即可成功，客户端看不到错误；4xx（如 429 限流）不重试。
+上游错误自动重试：
+  上游返回 5xx，或把"端点暂时不可用"标成 429（错误体含 "Endpoint is unavailable"）时，
+  只要还没向客户端吐出任何数据，代理就会重发（上限由 RETRY_ON_5XX_MAX 控制，默认 10 次）。
+  退避策略按状态码区分：5xx 固定退避 1 秒（瞬时故障，下一次通常就能成功）；
+  429 按 RETRY_429_BACKOFFS 指数退避（默认 4/8/16/32/64 秒），避免密集重试加剧服务端压力。
+  注意：按默认参数，10 次 429 重试的累计等待约 444 秒（4+8+16+32+64×6），
+  远超客户端自身的超时；流式请求靠心跳保活可撑住，非流式请求则由 RETRY_BUDGET 兜住：
+  该请求无法心跳续命，累计等待将超过预算（默认 60 秒）时就放弃重试，
+  原样透传上游的真实状态码（保留 429/503 语义，而不是拖到客户端超时）。
+  退避等待期间不阻塞主循环，流式请求的心跳保活仍在继续，客户端不会因等待而超时。
+  真正的限流类 429 与其他 4xx 不重试，避免把限流放大成多倍压力。
 
 指标观测：
   每次请求记录 TTFT（发包 -> 首个内容 token）、总耗时、输出 token 与吞吐，
@@ -107,11 +119,24 @@ HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL") or 10)
 # 最后兜底（秒）：距上一次"内容产出"（content / reasoning_content / tool_calls）超过该时长
 # 即主动终止请求，避免上游一直慢速输出却拿不到结果、白扣 token。0 表示不限制。
 CONTENT_IDLE_TIMEOUT = float(os.environ.get("CONTENT_IDLE_TIMEOUT") or 1800)
-# 上游 5xx 自动重试上限（次）：只在"还没向客户端吐出任何数据"时生效，此时重试不会产生重复内容。
-# 用于吞掉上游网关的瞬时 5xx（例如响应体为空的 503）。0 表示不重试。
-RETRY_ON_5XX_MAX = int(os.environ.get("RETRY_ON_5XX_MAX") or 5)
-# 5xx 重试前的退避秒数，给上游一点恢复时间
+# 上游错误自动重试上限（次）：只在"还没向客户端吐出任何数据"时生效，此时重试不会产生重复内容。
+# 覆盖 5xx，以及上游把"端点暂时不可用"标成 429 的情况（错误体含 Endpoint is unavailable）。
+# 0 表示不重试。
+RETRY_ON_5XX_MAX = int(os.environ.get("RETRY_ON_5XX_MAX") or 10)
+# 5xx 重试前的退避秒数：这类是瞬时网关故障，短退避即可快速恢复
 RETRY_ON_5XX_BACKOFF = 1.0
+# 429 重试的退避序列（秒）：默认 4/8/16/32/64，指数递增，给服务端留出恢复窗口；
+# 用逗号分隔可自定义，超出序列长度后沿用最后一个值
+RETRY_429_BACKOFFS = [float(x) for x in
+                      (os.environ.get("RETRY_429_BACKOFFS") or "4,8,16,32,64").split(",")
+                      if x.strip()]
+# 上游把瞬时端点故障标成 429 时的错误体特征，用于区别于真正的限流（限流不重试）
+TRANSIENT_ERROR_MARKERS = ("endpoint is unavailable",)
+# 重试总时长预算（秒）：仅在"无法用心跳续命"的请求（非流式）上生效。
+# 累计等待（自请求开始计时）将超过该预算时就不再重试，直接原样透传上游的真实状态码，
+# 避免客户端早已超时后还在白跑重试、白占上游配额。流式请求有心跳续命，不受此限。
+# 0 表示不限制。
+RETRY_BUDGET = float(os.environ.get("RETRY_BUDGET") or 60)
 MODEL_ALIAS_PREFIX = "proxy-"
 
 # 日志文件：默认脚本同目录 data\opencode-go-proxy.log，超过 5MB 自动轮转
@@ -304,8 +329,10 @@ class ColorConsoleFormatter(logging.Formatter):
     COLOR = "\x1b[1;36m"  # 高亮青色
     TTFT_MARK = "[ttft]"
     TTFT_COLOR = "\x1b[1;32m"  # 高亮绿色（指标行，方便一眼扫到）
-    # 上游返回非 200（4xx/5xx）就是有问题：整行标黄，一眼可见
-    NON_200_MARK = re.compile(r"-> [45]\d{2}\b|status=[45]\d{2}\b|HTTP/1\.1\" [45]\d{2}\b")
+    # 只要不是 200 就算有问题：整行标黄，一眼可见（含 3xx / 4xx / 5xx 及其他 2xx）
+    NON_200_MARK = re.compile(r"-> (?!200\b)\d{3}\b"
+                              r"|status=(?!200\b)\d{3}\b"
+                              r"|HTTP/1\.1\" (?!200\b)\d{3}\b")
     WARN_COLOR = "\x1b[1;33m"  # 高亮黄色
     RESET = "\x1b[0m"
 
@@ -585,6 +612,30 @@ def aggregate_stats(records):
     }
 
 
+def is_retryable_upstream_status(status, body_text):
+    """
+    上游错误是否值得原样重发：5xx 一律重试；429 仅在错误体表明是"端点暂时不可用"时重试。
+    真限流（如 rate limit exceeded）不重试，避免把限流放大成多倍压力。
+    """
+    if status >= 500:
+        return True
+    if status == 429:
+        low = (body_text or "").lower()
+        return any(m in low for m in TRANSIENT_ERROR_MARKERS)
+    return False
+
+
+def retry_backoff_seconds(status, retry_index):
+    """
+    第 retry_index 次重试（从 1 开始）前的等待秒数。
+    429 按指数退避（默认 4/8/16/32/64 秒），避免密集重试加剧服务端压力；
+    5xx 用固定短退避，这类瞬时故障通常下一次就能成功。
+    """
+    if status == 429 and RETRY_429_BACKOFFS:
+        return RETRY_429_BACKOFFS[min(retry_index - 1, len(RETRY_429_BACKOFFS) - 1)]
+    return RETRY_ON_5XX_BACKOFF
+
+
 class UpstreamAttempt(threading.Thread):
     """
     一次上游请求尝试。放在后台线程里跑，结果经队列回传，
@@ -737,7 +788,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
         attempts = []
         pending = [0]
         retry_fired = [False]
-        retry5xx_used = [0]
+        retry_used = [0]
+        prefetched_err_body = [None]
+        # 待执行的上游错误重试：(生效时刻, 状态码, 错误体, 第几次)
+        retry_at = [None]
+        pending_retry = [None]
         # 只有流式请求才能靠 SSE 注释续命：非流式响应无法在不提交响应头的前提下发心跳
         heartbeat_ok = stream_hint is True
         retry_deadline = metrics.t_start + RETRY_AFTER
@@ -753,20 +808,30 @@ class ProxyHandler(BaseHTTPRequestHandler):
             LOG.info("[attempt] %s 已发出 (session=%s, request=msg_%d)",
                      tag, session_id, req_num)
 
+        def fire_pending_retry():
+            """退避到点：发出这条重试，并清空待办"""
+            status, _body, idx = pending_retry[0]
+            pending_retry[0] = None
+            retry_at[0] = None
+            start_attempt("retry%s-%d" % ("429" if status == 429 else "5xx", idx))
+
         start_attempt("initial")
 
         winner = None
         resp = None
         err = None
-        while pending[0] > 0:
+        while pending[0] > 0 or retry_at[0] is not None:
             now = time.perf_counter()
             marks = []
-            if not retry_fired[0]:
+            # 有计划的退避重试时，不再叠加"无响应竞速重试"，避免两条重试互相干扰
+            if not retry_fired[0] and retry_at[0] is None:
                 marks.append(retry_deadline)
             if heartbeat_ok and not committed:
                 marks.append(heartbeat_deadline)
             if next_heartbeat_at is not None:
                 marks.append(next_heartbeat_at)
+            if retry_at[0] is not None:
+                marks.append(retry_at[0])
             future = [m for m in marks if m > now]
             if future:
                 wait = min(future) - now
@@ -794,27 +859,48 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         metrics.finish(200, session_id, "msg_%d" % req_num)
                         return
                     next_heartbeat_at = now + HEARTBEAT_INTERVAL
-                if not retry_fired[0] and now >= retry_deadline:
+                if retry_at[0] is not None and now >= retry_at[0]:
+                    fire_pending_retry()
+                elif retry_at[0] is None and not retry_fired[0] and now >= retry_deadline:
                     retry_fired[0] = True
                     start_attempt("retry")
                 continue
 
             pending[0] -= 1
             if e is None:
-                if (not committed and r.status >= 500
-                        and retry5xx_used[0] < RETRY_ON_5XX_MAX):
-                    # 上游网关瞬时 5xx（常见是响应体为空的 503）。此时还没向客户端吐过任何数据，
-                    # 丢掉这一轮并退避重发即可，客户端完全无感。
-                    retry5xx_used[0] += 1
-                    n = retry5xx_used[0]
+                err_body_raw = None
+                err_body_text = ""
+                # 注意：慢路径下即使已提前回 200（仅响应头 + 心跳注释，未发送任何内容），
+                # 依然可以安全重试——结果会并入已提交的 SSE 流下发。
+                if (retry_used[0] < RETRY_ON_5XX_MAX
+                        and (r.status >= 500 or r.status == 429)):
                     try:
-                        snippet = r.read()[:800].decode("utf-8", errors="replace")
+                        err_body_raw = r.read()
                     except Exception:
-                        snippet = ""
+                        err_body_raw = b""
+                    err_body_text = err_body_raw.decode("utf-8", errors="replace")
+                if (err_body_raw is not None
+                        and is_retryable_upstream_status(r.status, err_body_text)):
+                    # 上游瞬时故障（5xx，或把"端点不可用"标成 429）。此时还没向客户端吐过
+                    # 任何数据，丢掉这一轮并按退避计划重发即可，客户端完全无感。
+                    # 429 用指数退避（默认 4/8/16/32/64 秒），避免密集重试加剧服务端压力。
+                    n = retry_used[0] + 1
+                    backoff = retry_backoff_seconds(r.status, n)
+                    # 预算只在无法心跳续命的请求上生效：否则客户端早已超时，重试是白跑
+                    if (not heartbeat_ok and RETRY_BUDGET > 0
+                            and (time.perf_counter() - metrics.t_start) + backoff > RETRY_BUDGET):
+                        LOG.warning("[attempt] 上游 %d，但累计等待将超过预算 %gs（该请求无法心跳"
+                                    "续命），放弃重试并原样透传 (request=msg_%d)",
+                                    r.status, RETRY_BUDGET, req_num)
+                        metrics.error = "upstream %d (retry budget exhausted)" % r.status
+                        prefetched_err_body[0] = err_body_raw
+                        winner, resp = attempt, r
+                        break
+                    retry_used[0] = n
                     LOG.warning("[attempt] 上游 %d，退避 %gs 后重发（第 %d/%d 次）: %s "
                                 "(request=msg_%d)",
-                                r.status, RETRY_ON_5XX_BACKOFF, n, RETRY_ON_5XX_MAX,
-                                snippet, req_num)
+                                r.status, backoff, n, RETRY_ON_5XX_MAX,
+                                err_body_text[:800], req_num)
                     for a in attempts:
                         a.abandon()
                     attempts = []
@@ -824,9 +910,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         except queue.Empty:
                             break
                     pending[0] = 0
-                    time.sleep(RETRY_ON_5XX_BACKOFF)
-                    start_attempt("retry5xx-%d" % n)
+                    # 不阻塞等待：交给主循环按退避时刻触发，期间心跳仍可继续为客户端续命
+                    pending_retry[0] = (r.status, err_body_text, n)
+                    retry_at[0] = time.perf_counter() + backoff
                     continue
+                # 不重试：把已读出的错误体留给下面的转发分支复用，避免重复读
+                prefetched_err_body[0] = err_body_raw
                 winner, resp = attempt, r
                 break
             err = e
@@ -866,7 +955,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if committed:
                 # 已提前回 200 + SSE：上游结果并入这条流，错误以 SSE 事件下发并收尾
                 if status >= 400:
-                    err_body = resp.read()
+                    err_body = (prefetched_err_body[0] if prefetched_err_body[0] is not None
+                                else resp.read())
                     metrics.on_chunk(err_body, is_sse=False)
                     snippet = err_body[:800].decode("utf-8", errors="replace")
                     LOG.error("[upstream-error] body: %s", snippet)
@@ -889,7 +979,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             if status >= 400:
                 # 4xx/5xx：完整读出错误体，打印便于定位，并原样回给客户端
-                err_body = resp.read()
+                err_body = (prefetched_err_body[0] if prefetched_err_body[0] is not None
+                            else resp.read())
                 metrics.on_chunk(err_body, is_sse=False)
                 snippet = err_body[:800].decode("utf-8", errors="replace")
                 LOG.error("[upstream-error] body: %s", snippet)

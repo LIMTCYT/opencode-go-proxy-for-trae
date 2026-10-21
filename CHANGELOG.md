@@ -6,6 +6,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- TTFT / 总耗时 / 吞吐指标：每次请求输出一行 `[ttft]` 日志（首内容 token 延迟、总耗时、输出 token、tok/s）。
+- 本地只读接口 `GET /stats`：返回最近 `STATS_WINDOW`（默认 200）条样本的整体与按模型聚合（avg / p50 / p95 / min / max / errors）。
+
 ## [1.1.0] - 2026-10-13
 
 ### Added

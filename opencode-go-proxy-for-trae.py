@@ -20,11 +20,14 @@ Trae 注意：自定义模型的"模型 ID"不能与官方预设重名（如 glm
 
 运行：
   python opencode-go-proxy-for-trae.py
-Trae 自定义模型请求地址填: http://127.0.0.1:9355/inference/go/v1 或 /zen/go/v1
+Trae 自定义模型请求地址填: http://127.0.0.1:9355/zen/go/v1（老路由，推荐）
+或 /inference/go/v1（新路由）
 （按客户端路径原样透传，上游两条路由都还在，填哪个都能用）
-注意：model ID 与请求地址要配套，填错会 404 —— 新 model ID（如 deepseek-v4.1-flash）
-只在新路由 /inference/go/v1 提供，老 model ID（如 deepseek-flash）只在旧路由
-/zen/go/v1 提供，请在 Trae 里按模型所属路由填对应 Base URL。
+推荐用老路由：新路由 /inference/go/v1 会间歇性报 429（Endpoint is unavailable），
+同一模型换老路由 /zen/go/v1 即可正常对话。
+注意：model ID 与请求地址要配套，填错会 404 —— 老 model ID（如 deepseek-flash）
+只在旧路由 /zen/go/v1 提供，新 model ID（如 deepseek-v4.1-flash）只在新路由
+/inference/go/v1 提供，请在 Trae 里按模型所属路由填对应 Base URL。
 OpenCode Go 官方文档: https://opencode.ai/v2/docs/console/go/
 
 配置（环境变量）：
@@ -771,11 +774,12 @@ def main():
     # 空两行再打印关键信息，终端里更醒目
     sys.stderr.write("\n\n")
     sys.stderr.flush()
-    LOG.info("[opencode-go-proxy] Trae 请求地址填: http://127.0.0.1:%d/inference/go/v1（新）或 "
-             "http://127.0.0.1:%d/zen/go/v1（旧）（按客户端路径原样透传，模型 ID 填 %s真实模型名）\n"
+    LOG.info("[opencode-go-proxy] Trae 请求地址填: http://127.0.0.1:%d/zen/go/v1（老路由，推荐，更稳定）或 "
+             "http://127.0.0.1:%d/inference/go/v1（新路由）（按客户端路径原样透传，模型 ID 填 %s真实模型名）\n"
              "注意：model ID 与请求地址要配套，填错会 404 —— "
-             "新 model ID（如 deepseek-v4.1-flash）走 /inference/go/v1，"
-             "老 model ID（如 deepseek-flash）走 /zen/go/v1",
+             "老 model ID（如 deepseek-flash）走 /zen/go/v1，"
+             "新 model ID（如 deepseek-v4.1-flash）走 /inference/go/v1\n"
+             "提示：新路由 /inference/go/v1 会间歇性报 429（Endpoint is unavailable），优先用老路由 /zen/go/v1",
              PROXY_PORT, PROXY_PORT, MODEL_ALIAS_PREFIX)
     try:
         server.serve_forever()

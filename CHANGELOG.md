@@ -6,6 +6,8 @@
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-10-21
+
 ### Added
 
 - 上游错误自动重试（`RETRY_ON_5XX_MAX`，默认 `10`）：只要尚未向客户端吐出任何数据，遇到上游 `5xx`，或错误体含 `Endpoint is unavailable` 的 `429`（上游把瞬时端点故障标成了 429），就重发，客户端无感。真正的限流类 429 与其他 `4xx` 不重试，设为 `0` 可关闭。
@@ -16,6 +18,10 @@
 
 - 控制台日志配色：响应状态码不是 `200` 的日志行改为**黄色**高亮（原先只覆盖 4xx/5xx，现含 3xx、其他 2xx），便于一眼定位非成功请求。
 - 文档修正：`Endpoint is unavailable` 并非新路由独有，老路由 `/zen/go/v1` 也会返回，只是状态码为 `429`（新路由为 `503`）。
+
+### Fixed
+
+- 慢路径下已提前回 `200` 后不再重试的问题：心跳只是 SSE 注释行、不含任何内容，因此重试依然安全，结果会并入已提交的流下发。原先该判断会误伤慢路径下的重试。
 
 ## [1.2.0] - 2026-10-21
 
@@ -53,7 +59,8 @@
 - 纯 Python 标准库实现，无需安装任何第三方依赖，Python 3.6+ 即可运行。
 - MIT License 与 `.gitignore`。
 
-[Unreleased]: https://github.com/LIMTCYT/opencode-go-proxy-for-trae/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/LIMTCYT/opencode-go-proxy-for-trae/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/LIMTCYT/opencode-go-proxy-for-trae/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/LIMTCYT/opencode-go-proxy-for-trae/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/LIMTCYT/opencode-go-proxy-for-trae/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/LIMTCYT/opencode-go-proxy-for-trae/releases/tag/v1.0.0
